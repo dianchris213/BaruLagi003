@@ -37,7 +37,7 @@ export const generateInsight = createServerFn({ method: "POST" })
     const totalOut = data.wallets.reduce((s, w) => s + w.out, 0);
 
     const result = streamText({
-      model: gateway("google/gemini-3.5-flash"),
+      model: gateway("google/gemini-3.8-flash"),
       system:
         "Kamu asisten keuangan pribadi berbahasa Indonesia. Jawab ringkas, maksimal 4 kalimat pendek, nada profesional, tanpa markdown, tanpa emoji. Gunakan format rupiah Indonesia.",
       prompt: [
