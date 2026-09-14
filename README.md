@@ -22,3 +22,15 @@ cd <repository-name>
 npm i
 npm run dev
 ```
+
+## Pembaruan terbaru
+
+- **Wawasan AI** di halaman Ringkasan: merangkum pemasukan & pengeluaran bulan aktif
+  lewat Lovable AI Gateway (`src/lib/insights.functions.ts`) dari data lokal saja.
+- **Zona waktu** dapat dipilih di Pengaturan (`src/lib/timezone.ts`). Reset harian
+  (pendapatan driver) dan reset bulanan (arus kas dompet) dihitung dari zona ini,
+  bukan jam perangkat, sehingga tidak rollover ganda antar perangkat.
+- **Aksesibilitas notifikasi**: focus trap, navigasi panah/Home/End/Enter/Esc, dan
+  pengumuman `aria-live` untuk jumlah notifikasi belum dibaca.
+- **Tanpa peringatan hidrasi**: seluruh pembacaan `localStorage` ditunda sampai status
+  `ready`, dan penulisan ke storage juga digerbangi status tersebut.
