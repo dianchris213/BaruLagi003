@@ -1,13 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
 import {
   Bell,
   Bike,
   Droplets,
+  Globe2,
   Home,
+  Loader2,
   Minus,
   Plus,
   Settings,
+  Sparkles,
   User,
   Wallet,
   X,
@@ -15,20 +19,35 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import { generateInsight } from "@/lib/insights.functions";
+import {
+  DEFAULT_TIMEZONE,
+  LS_TIMEZONE,
+  TIMEZONES,
+  dayKey,
+  detectTimezone,
+  isTimezoneId,
+  monthKey,
+  monthLabel,
+  msUntilZonedMidnight,
+  timezoneLabel,
+  type TimezoneId,
+} from "@/lib/timezone";
+
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Keuangan Dian — Mini App" },
+      { title: "Ringkasan Keuangan — Mini App Dian" },
       {
         name: "description",
         content:
-          "Pencatatan keuangan pribadi: dompet, tagihan bulanan, dan ringkasan uang dalam satu mini app mobile-first.",
+          "Ringkasan dompet, tagihan bulanan, dan wawasan AI pemasukan & pengeluaran dalam satu mini app mobile-first.",
       },
-      { property: "og:title", content: "Keuangan Dian — Mini App" },
+      { property: "og:title", content: "Ringkasan Keuangan — Mini App Dian" },
       {
         property: "og:description",
         content:
-          "Dompet, tagihan bulanan interaktif, dan ringkasan uang dalam satu tampilan mobile-first.",
+          "Dompet, tagihan bulanan interaktif, wawasan AI, dan reset harian sesuai zona waktu pilihanmu.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
@@ -43,6 +62,7 @@ type Bill = { id: string; name: string; amount: number; daysLeft: number; icon: 
 type WalletItem = { id: string; name: string; balance: number };
 type Profile = { name: string; email: string; password: string };
 type Flow = { in: number; out: number };
+type FlowStore = { month: string; data: Record<string, Flow> };
 type DailyStore = { day: string; in: number; out: number };
 type ProfileErrors = Partial<Record<keyof Profile, string>>;
 
@@ -53,7 +73,7 @@ const BILLS: Bill[] = [
 ];
 
 const WALLETS: WalletItem[] = [
-  { id: "shopee", name: "Driver Shopee", balance: 350_000, },
+  { id: "shopee", name: "Driver Shopee", balance: 350_000 },
   { id: "ayah", name: "Keperluan Ayah", balance: 200_000 },
   { id: "ibu", name: "Keperluan Ibu", balance: 150_000 },
 ];
@@ -72,49 +92,21 @@ function formatRupiah(n: number) {
   return "Rp " + Math.round(n).toLocaleString("id-ID");
 }
 
-/** Local timezone of the device; resets follow this zone, never UTC. */
-function localZone() {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  } catch {
-    return "UTC";
-  }
-}
-
-/** Local calendar parts (y/m/d) in the device timezone. */
-function localParts(d = new Date()) {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: localZone(),
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const [y = "1970", m = "01", day = "01"] = fmt.format(d).split("-");
-  return { y, m, day };
-}
-
-function dayKey(d = new Date()) {
-  const { y, m, day } = localParts(d);
-  return `${y}-${m}-${day}`;
-}
-
-/** Milliseconds until the next local midnight (min 1s, capped at 1h for drift safety). */
-function msUntilLocalMidnight() {
-  const now = new Date();
-  const next = new Date(now);
-  next.setHours(24, 0, 0, 0);
-  return Math.min(Math.max(next.getTime() - now.getTime(), 1_000), 3_600_000);
-}
-
 function readJSON<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
   try {
-    const raw = localStorage.getItem(key);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return fallback;
     return JSON.parse(raw) as T;
   } catch {
     return fallback;
   }
+}
+
+function loadTimezone(): TimezoneId {
+  if (typeof window === "undefined") return DEFAULT_TIMEZONE;
+  const raw = window.localStorage.getItem(LS_TIMEZONE);
+  return isTimezoneId(raw) ? raw : detectTimezone();
 }
 
 function loadProfile(): Profile {
@@ -131,29 +123,25 @@ function emptyFlows(): Record<string, Flow> {
   return Object.fromEntries(WALLETS.map((w) => [w.id, { in: 0, out: 0 }]));
 }
 
-/** Wallet totals are cumulative — no monthly reset. */
-function loadFlows(): Record<string, Flow> {
-  const raw = readJSON<unknown>(LS_FLOWS, null);
-  const source =
-    raw && typeof raw === "object" && "data" in (raw as Record<string, unknown>)
-      ? (raw as { data?: Record<string, Flow> }).data
-      : (raw as Record<string, Flow> | null);
-  const base = emptyFlows();
-  if (!source || typeof source !== "object") return base;
+/** Wallet flows reset per calendar month of the chosen timezone. */
+function loadFlows(month: string): FlowStore {
+  const raw = readJSON<Partial<FlowStore> | null>(LS_FLOWS, null);
+  const base: FlowStore = { month, data: emptyFlows() };
+  if (!raw || raw.month !== month || !raw.data || typeof raw.data !== "object") return base;
   for (const w of WALLETS) {
-    const f = source[w.id];
+    const f = raw.data[w.id];
     if (f && typeof f === "object") {
-      base[w.id] = { in: Number(f.in) || 0, out: Number(f.out) || 0 };
+      base.data[w.id] = { in: Number(f.in) || 0, out: Number(f.out) || 0 };
     }
   }
   return base;
 }
 
-function loadDaily(): DailyStore {
-  const today = dayKey();
+/** Driver net resets per calendar day of the chosen timezone. */
+function loadDaily(day: string): DailyStore {
   const s = readJSON<DailyStore | null>(LS_DAILY, null);
-  if (!s || s.day !== today) return { day: today, in: 0, out: 0 };
-  return { day: today, in: Number(s.in) || 0, out: Number(s.out) || 0 };
+  if (!s || s.day !== day) return { day, in: 0, out: 0 };
+  return { day, in: Number(s.in) || 0, out: Number(s.out) || 0 };
 }
 
 function validateProfile(p: Profile): ProfileErrors {
@@ -173,83 +161,113 @@ function validateProfile(p: Profile): ProfileErrors {
   return e;
 }
 
+const FOCUSABLE = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
 /* ---------- App ---------- */
 
 function Index() {
   const [tab, setTab] = useState<"home" | "settings">("home");
-  const [paid, setPaid] = useState<Record<string, boolean>>(() =>
-    readJSON<Record<string, boolean>>(LS_BILLS, {}),
-  );
-  const [seen, setSeen] = useState<Record<string, boolean>>(() =>
-    readJSON<Record<string, boolean>>(LS_SEEN, {}),
-  );
+
+  /**
+   * Nothing reads localStorage during render or state initialisation: the
+   * server render and the first client render are identical, and persisted
+   * data is applied once `ready` flips inside an effect. This removes the
+   * hydration mismatch warning the previous eager reads produced.
+   */
+  const [ready, setReady] = useState(false);
+  const [timezone, setTimezone] = useState<TimezoneId>(DEFAULT_TIMEZONE);
+  const [paid, setPaid] = useState<Record<string, boolean>>({});
+  const [seen, setSeen] = useState<Record<string, boolean>>({});
   const [profile, setProfile] = useState<Profile>(EMPTY_PROFILE);
-  const [flows, setFlows] = useState<Record<string, Flow>>(() => emptyFlows());
-  const [daily, setDaily] = useState<DailyStore>(() => ({ day: dayKey(), in: 0, out: 0 }));
+  const [flows, setFlows] = useState<FlowStore>({ month: "", data: emptyFlows() });
+  const [daily, setDaily] = useState<DailyStore>({ day: "", in: 0, out: 0 });
   const [saved, setSaved] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
 
-  const hydrated = useRef(false);
+  const [insight, setInsight] = useState("");
+  const [insightLoading, setInsightLoading] = useState(false);
+  const [insightError, setInsightError] = useState("");
+
   const dialogRef = useRef<HTMLDivElement>(null);
   const bellRef = useRef<HTMLButtonElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
 
   const errors = useMemo(() => validateProfile(profile), [profile]);
   const isValid = Object.keys(errors).length === 0;
 
-  /* restore persisted state after hydration */
+  /* 1. Restore persisted state after mount, then unlock writes. */
   useEffect(() => {
+    const zone = loadTimezone();
+    setTimezone(zone);
+    setPaid(readJSON<Record<string, boolean>>(LS_BILLS, {}));
+    setSeen(readJSON<Record<string, boolean>>(LS_SEEN, {}));
     setProfile(loadProfile());
-    setFlows(loadFlows());
-    setDaily(loadDaily());
-    hydrated.current = true;
+    setFlows(loadFlows(monthKey(zone)));
+    setDaily(loadDaily(dayKey(zone)));
+    setReady(true);
   }, []);
 
-  /* timezone-aware daily rollover, scheduled on the next local midnight */
+  /* 2. Timezone-aware rollover: on zone change, at zoned midnight, on refocus. */
+  const syncPeriods = useCallback(
+    (zone: TimezoneId) => {
+      const day = dayKey(zone);
+      const month = monthKey(zone);
+      setDaily((d) => (d.day === day ? d : { day, in: 0, out: 0 }));
+      setFlows((f) => (f.month === month ? f : { month, data: emptyFlows() }));
+    },
+    [],
+  );
+
   useEffect(() => {
+    if (!ready) return;
+    syncPeriods(timezone);
+
     let timer = 0;
     const schedule = () => {
       timer = window.setTimeout(() => {
-        setDaily((d) => (d.day === dayKey() ? d : { day: dayKey(), in: 0, out: 0 }));
+        syncPeriods(timezone);
         schedule();
-      }, msUntilLocalMidnight());
+      }, msUntilZonedMidnight(timezone));
     };
     schedule();
+
     const onVisible = () => {
-      if (document.visibilityState === "visible") {
-        setDaily((d) => (d.day === dayKey() ? d : { day: dayKey(), in: 0, out: 0 }));
-      }
+      if (document.visibilityState === "visible") syncPeriods(timezone);
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [ready, timezone, syncPeriods]);
 
+  /* 3. Persistence — gated on `ready` so defaults never overwrite saved data. */
   useEffect(() => {
-    localStorage.setItem(LS_BILLS, JSON.stringify(paid));
-  }, [paid]);
+    if (ready) window.localStorage.setItem(LS_TIMEZONE, timezone);
+  }, [ready, timezone]);
   useEffect(() => {
-    localStorage.setItem(LS_SEEN, JSON.stringify(seen));
-  }, [seen]);
+    if (ready) window.localStorage.setItem(LS_BILLS, JSON.stringify(paid));
+  }, [ready, paid]);
   useEffect(() => {
-    if (!hydrated.current) return;
-    localStorage.setItem(LS_FLOWS, JSON.stringify(flows));
-  }, [flows]);
+    if (ready) window.localStorage.setItem(LS_SEEN, JSON.stringify(seen));
+  }, [ready, seen]);
   useEffect(() => {
-    localStorage.setItem(LS_DAILY, JSON.stringify(daily));
-  }, [daily]);
+    if (ready && flows.month) window.localStorage.setItem(LS_FLOWS, JSON.stringify(flows));
+  }, [ready, flows]);
+  useEffect(() => {
+    if (ready && daily.day) window.localStorage.setItem(LS_DAILY, JSON.stringify(daily));
+  }, [ready, daily]);
 
-  /* debounced profile auto-save; invalid fields are never persisted */
+  /* Debounced profile auto-save; invalid fields are never persisted. */
   useEffect(() => {
-    if (!hydrated.current || !isValid) return;
+    if (!ready || !isValid) return;
     const id = window.setTimeout(() => {
-      localStorage.setItem(LS_PROFILE, JSON.stringify(profile));
+      window.localStorage.setItem(LS_PROFILE, JSON.stringify(profile));
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1500);
     }, 500);
     return () => window.clearTimeout(id);
-  }, [profile, isValid]);
+  }, [ready, profile, isValid]);
 
   const notifications = useMemo(
     () =>
@@ -264,21 +282,47 @@ function Index() {
   );
   const unseenCount = notifications.filter((n) => !n.seen).length;
 
-  /* focus trap for notification dialog */
+  const closeNotif = useCallback(() => {
+    setNotifOpen(false);
+    bellRef.current?.focus();
+  }, []);
+
+  /* Focus trap + roving arrow-key navigation inside the notification dialog. */
   useEffect(() => {
     if (!notifOpen) return;
     const node = dialogRef.current;
-    node?.querySelector<HTMLElement>("button")?.focus();
+    const previous = document.activeElement as HTMLElement | null;
+    node?.querySelector<HTMLElement>("[data-notif-first]")?.focus();
+
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        e.preventDefault();
         setNotifOpen(false);
-        bellRef.current?.focus();
+        previous?.focus();
         return;
       }
+
+      if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Home" || e.key === "End") {
+        const rows = Array.from(
+          listRef.current?.querySelectorAll<HTMLElement>('[role="option"]') ?? [],
+        );
+        if (rows.length === 0) return;
+        e.preventDefault();
+        const current = rows.findIndex((r) => r.contains(document.activeElement));
+        const next =
+          e.key === "Home"
+            ? 0
+            : e.key === "End"
+              ? rows.length - 1
+              : e.key === "ArrowDown"
+                ? (current + 1 + rows.length) % rows.length
+                : (current - 1 + rows.length) % rows.length;
+        rows[next]?.focus();
+        return;
+      }
+
       if (e.key !== "Tab" || !node) return;
-      const items = node.querySelectorAll<HTMLElement>(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-      );
+      const items = node.querySelectorAll<HTMLElement>(FOCUSABLE);
       if (items.length === 0) return;
       const first = items[0]!;
       const last = items[items.length - 1]!;
@@ -290,6 +334,7 @@ function Index() {
         first.focus();
       }
     };
+
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [notifOpen]);
@@ -301,14 +346,40 @@ function Index() {
   const saveProfile = (e: React.FormEvent) => {
     e.preventDefault();
     if (!isValid) return;
-    localStorage.setItem(LS_PROFILE, JSON.stringify(profile));
+    window.localStorage.setItem(LS_PROFILE, JSON.stringify(profile));
     setSaved(true);
     window.setTimeout(() => setSaved(false), 2000);
   };
 
   const driverNet = daily.in - daily.out;
-  const totalIn = Object.values(flows).reduce((s, f) => s + (f?.in ?? 0), 0);
-  const totalOut = Object.values(flows).reduce((s, f) => s + (f?.out ?? 0), 0);
+  const totalIn = Object.values(flows.data).reduce((s, f) => s + (f?.in ?? 0), 0);
+  const totalOut = Object.values(flows.data).reduce((s, f) => s + (f?.out ?? 0), 0);
+  const periodKey = flows.month || monthKey(timezone);
+
+  /* AI insight from locally stored data only. */
+  const requestInsight = useServerFn(generateInsight);
+  const runInsight = async () => {
+    setInsightLoading(true);
+    setInsightError("");
+    try {
+      const res = await requestInsight({
+        data: {
+          period: periodKey,
+          wallets: WALLETS.map((w) => {
+            const f = flows.data[w.id] ?? { in: 0, out: 0 };
+            return { name: w.name, balance: w.balance, in: f.in, out: f.out };
+          }),
+          bills: BILLS.map((b) => ({ name: b.name, amount: b.amount, paid: !!paid[b.id] })),
+          driverNet,
+        },
+      });
+      setInsight(res.text);
+    } catch {
+      setInsightError("Wawasan AI belum bisa dibuat. Coba lagi sebentar lagi.");
+    } finally {
+      setInsightLoading(false);
+    }
+  };
 
   const fieldClass = (bad: boolean) =>
     `mt-1 w-full rounded-xl border bg-slate-50 px-3 py-2.5 text-sm text-slate-800 outline-none ${
@@ -320,7 +391,6 @@ function Index() {
       <div className="relative mx-auto min-h-screen w-full max-w-[480px] pb-24">
         {tab === "home" ? (
           <>
-            {/* 1. Header */}
             <header className="flex items-center gap-3 px-5 pt-6">
               <div className="flex size-11 shrink-0 items-center justify-center rounded-full bg-slate-800">
                 <User className="size-5 text-white" aria-hidden="true" />
@@ -336,7 +406,7 @@ function Index() {
                 aria-haspopup="dialog"
                 aria-expanded={notifOpen}
                 aria-label={`Notifikasi tagihan, ${unseenCount} belum dibaca`}
-                className="relative flex size-10 items-center justify-center rounded-full bg-white shadow-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-800"
+                className="relative flex size-11 items-center justify-center rounded-full bg-white shadow-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-800"
               >
                 <Bell className="size-5 text-slate-800" aria-hidden="true" />
                 {unseenCount > 0 && (
@@ -351,7 +421,6 @@ function Index() {
             </header>
 
             <main className="space-y-4 px-4 pt-4">
-              {/* 2. Notifikasi banner */}
               {!paid["listrik"] && (
                 <div
                   role="alert"
@@ -361,12 +430,11 @@ function Index() {
                 </div>
               )}
 
-              {/* 3. Daftar Dompet */}
               <section aria-label="Daftar Dompet" className="rounded-2xl bg-white p-4 shadow-sm">
                 <h2 className="text-base font-bold text-slate-800">Daftar Dompet</h2>
                 <ul className="mt-2 divide-y divide-slate-100">
                   {WALLETS.map((w) => {
-                    const f = flows[w.id] ?? { in: 0, out: 0 };
+                    const f = flows.data[w.id] ?? { in: 0, out: 0 };
                     return (
                       <li key={w.id} className="flex items-center gap-3 py-3">
                         <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-slate-100">
@@ -377,14 +445,14 @@ function Index() {
                           <div className="mt-1 flex flex-wrap gap-2">
                             <span
                               className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-600"
-                              aria-label={`Total pemasukan ${w.name} ${formatRupiah(f.in)}`}
+                              aria-label={`Pemasukan ${w.name} bulan ini ${formatRupiah(f.in)}`}
                             >
                               <Plus className="size-3" aria-hidden="true" />
                               {formatRupiah(f.in)}
                             </span>
                             <span
                               className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-600"
-                              aria-label={`Total pengeluaran ${w.name} ${formatRupiah(f.out)}`}
+                              aria-label={`Pengeluaran ${w.name} bulan ini ${formatRupiah(f.out)}`}
                             >
                               <Minus className="size-3" aria-hidden="true" />
                               {formatRupiah(f.out)}
@@ -400,7 +468,6 @@ function Index() {
                 </ul>
               </section>
 
-              {/* 4. Tagihan Bulanan */}
               <section aria-label="Tagihan Bulanan" className="rounded-2xl bg-white p-4 shadow-sm">
                 <h2 className="text-base font-bold text-slate-800">Tagihan Bulanan</h2>
                 <ul className="mt-2 divide-y divide-slate-100">
@@ -439,7 +506,6 @@ function Index() {
                 </ul>
               </section>
 
-              {/* 5. Pendapatan Bersih (harian) */}
               <section
                 aria-label="Pendapatan Bersih"
                 className="rounded-2xl bg-white p-5 text-center shadow-sm"
@@ -453,14 +519,18 @@ function Index() {
                   {formatRupiah(driverNet)}
                 </p>
                 <p className="mt-1 text-[11px] text-slate-400">
-                  Masuk {formatRupiah(daily.in)} • Keluar {formatRupiah(daily.out)} • reset tiap
-                  hari ({localZone()})
+                  Masuk {formatRupiah(daily.in)} • Keluar {formatRupiah(daily.out)} • reset harian{" "}
+                  {timezoneLabel(timezone)}
                 </p>
               </section>
 
-              {/* 6. Ringkasan Uang */}
               <section aria-label="Ringkasan Uang" className="rounded-2xl bg-white p-4 shadow-sm">
-                <h2 className="text-base font-bold text-slate-800">Ringkasan Uang</h2>
+                <div className="flex items-baseline justify-between gap-2">
+                  <h2 className="text-base font-bold text-slate-800">Ringkasan Uang</h2>
+                  <p className="text-[11px] font-semibold text-slate-400">
+                    {monthLabel(periodKey)}
+                  </p>
+                </div>
                 <div className="mt-3 grid grid-cols-2 gap-3">
                   <div className="rounded-xl bg-slate-50 p-3 text-center">
                     <p className="text-xs text-slate-500">Total Pemasukan</p>
@@ -476,18 +546,107 @@ function Index() {
                   </div>
                 </div>
               </section>
+
+              {/* Wawasan AI */}
+              <section aria-label="Wawasan AI" className="rounded-2xl bg-white p-4 shadow-sm">
+                <div className="flex items-start gap-3">
+                  <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-slate-900">
+                    <Sparkles className="size-4 text-white" aria-hidden="true" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <h2 className="text-base font-bold text-slate-800">Wawasan AI</h2>
+                    <p className="text-xs text-slate-500">
+                      Ringkasan pemasukan & pengeluaran {monthLabel(periodKey)} dari data yang
+                      tersimpan di perangkat ini.
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={runInsight}
+                  disabled={!ready || insightLoading}
+                  aria-busy={insightLoading}
+                  className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-slate-800 py-2.5 text-sm font-bold text-white transition-colors hover:bg-slate-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {insightLoading ? (
+                    <>
+                      <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+                      Menyusun wawasan…
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="size-4" aria-hidden="true" />
+                      {insight ? "Buat ulang wawasan" : "Buat wawasan bulan ini"}
+                    </>
+                  )}
+                </button>
+
+                <div aria-live="polite" className="mt-3">
+                  {insightLoading && (
+                    <p className="text-xs text-slate-500">
+                      Menganalisis pemasukan dan pengeluaranmu…
+                    </p>
+                  )}
+                  {!insightLoading && insightError && (
+                    <p role="alert" className="text-xs font-semibold text-rose-500">
+                      {insightError}
+                    </p>
+                  )}
+                  {!insightLoading && !insightError && insight && (
+                    <p className="whitespace-pre-line rounded-xl bg-slate-50 p-3 text-sm leading-relaxed text-slate-700">
+                      {insight}
+                    </p>
+                  )}
+                </div>
+              </section>
             </main>
           </>
         ) : (
           /* ---------- Halaman Pengaturan ---------- */
           <main className="px-4 pt-8">
             <h1 className="text-xl font-bold text-slate-800">Pengaturan</h1>
-            <p className="mt-1 text-sm text-slate-500">Kelola profil akun kamu.</p>
+            <p className="mt-1 text-sm text-slate-500">Kelola profil dan zona waktu kamu.</p>
+
+            <section
+              aria-label="Zona Waktu"
+              className="mt-5 rounded-2xl bg-white p-5 shadow-sm"
+            >
+              <h2 className="flex items-center gap-2 text-base font-bold text-slate-800">
+                <Globe2 className="size-4" aria-hidden="true" /> Zona Waktu
+              </h2>
+              <label htmlFor="timezone" className="mt-3 block text-xs font-semibold text-slate-800">
+                Zona waktu perhitungan
+              </label>
+              <select
+                id="timezone"
+                value={timezone}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  if (isTimezoneId(value)) setTimezone(value);
+                }}
+                aria-describedby="timezone-help"
+                className="mt-1 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-800 outline-none focus:border-slate-800"
+              >
+                {TIMEZONES.map((tz) => (
+                  <option key={tz.id} value={tz.id}>
+                    {tz.label}
+                  </option>
+                ))}
+              </select>
+              <p id="timezone-help" className="mt-2 text-[11px] text-slate-500">
+                Reset pendapatan harian dan ringkasan bulanan mengikuti zona ini, bukan jam
+                perangkat, jadi datamu tidak rollover dua kali di perangkat berbeda.
+              </p>
+              <p role="status" className="mt-2 text-[11px] font-semibold text-slate-600">
+                Hari aktif: {dayKey(timezone)} • Bulan aktif: {monthLabel(periodKey)}
+              </p>
+            </section>
 
             <form
               onSubmit={saveProfile}
               noValidate
-              className="mt-5 space-y-4 rounded-2xl bg-white p-5 shadow-sm"
+              className="mt-4 space-y-4 rounded-2xl bg-white p-5 shadow-sm"
             >
               <div>
                 <label htmlFor="nama" className="text-xs font-semibold text-slate-800">
@@ -504,7 +663,11 @@ function Index() {
                   className={fieldClass(!!errors.name)}
                 />
                 {errors.name && (
-                  <p id="nama-error" role="alert" className="mt-1 text-[11px] font-semibold text-rose-500">
+                  <p
+                    id="nama-error"
+                    role="alert"
+                    className="mt-1 text-[11px] font-semibold text-rose-500"
+                  >
                     {errors.name}
                   </p>
                 )}
@@ -524,7 +687,11 @@ function Index() {
                   className={fieldClass(!!errors.email)}
                 />
                 {errors.email && (
-                  <p id="email-error" role="alert" className="mt-1 text-[11px] font-semibold text-rose-500">
+                  <p
+                    id="email-error"
+                    role="alert"
+                    className="mt-1 text-[11px] font-semibold text-rose-500"
+                  >
                     {errors.email}
                   </p>
                 )}
@@ -582,36 +749,62 @@ function Index() {
               ref={dialogRef}
               role="dialog"
               aria-modal="true"
-              aria-label="Daftar notifikasi"
+              aria-labelledby="notif-title"
+              aria-describedby="notif-help"
               className="relative w-full max-w-[480px] rounded-t-2xl bg-white p-5 shadow-lg"
             >
               <div className="flex items-center justify-between">
-                <h2 className="text-base font-bold text-slate-800">
+                <h2 id="notif-title" className="text-base font-bold text-slate-800">
                   Notifikasi{unseenCount > 0 ? ` (${unseenCount} belum dibaca)` : ""}
                 </h2>
                 <button
+                  data-notif-first
                   type="button"
-                  onClick={() => {
-                    setNotifOpen(false);
-                    bellRef.current?.focus();
-                  }}
+                  onClick={closeNotif}
                   aria-label="Tutup notifikasi"
-                  className="rounded-full p-1.5 text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-800"
+                  className="rounded-full p-2 text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-800"
                 >
                   <X className="size-5" aria-hidden="true" />
                 </button>
               </div>
 
-              <ul className="mt-3 max-h-[50vh] space-y-2 overflow-y-auto">
+              <p id="notif-help" className="mt-1 text-[11px] text-slate-500">
+                Gunakan tombol panah atas/bawah untuk menelusuri notifikasi, Enter untuk menandai
+                dibaca, Esc untuk menutup.
+              </p>
+
+              {/* Screen-reader announcement for the list state */}
+              <p aria-live="polite" className="sr-only">
+                {notifications.length === 0
+                  ? "Tidak ada notifikasi tagihan."
+                  : `${notifications.length} notifikasi tagihan, ${unseenCount} belum dibaca.`}
+              </p>
+
+              <ul
+                ref={listRef}
+                role="listbox"
+                aria-label="Daftar notifikasi tagihan"
+                className="mt-3 max-h-[50vh] space-y-2 overflow-y-auto"
+              >
                 {notifications.length === 0 && (
                   <li className="py-6 text-center text-sm text-slate-500">
-                    Tidak ada tagihan jatuh tempo. 🎉
+                    Tidak ada tagihan jatuh tempo.
                   </li>
                 )}
-                {notifications.map((n) => (
+                {notifications.map((n, i) => (
                   <li
                     key={n.id}
-                    className={`flex items-center gap-3 rounded-xl p-3 ${
+                    role="option"
+                    tabIndex={i === 0 ? 0 : -1}
+                    aria-selected={!n.seen}
+                    aria-label={`${n.title}. ${n.body}. ${n.seen ? "Sudah dibaca" : "Belum dibaca"}`}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setSeen((s) => ({ ...s, [n.id]: true }));
+                      }
+                    }}
+                    className={`flex items-center gap-3 rounded-xl p-3 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-800 ${
                       n.seen ? "bg-slate-50" : "bg-rose-50"
                     }`}
                   >
@@ -624,13 +817,18 @@ function Index() {
                       <p className="text-xs text-slate-500">{n.body}</p>
                     </div>
                     {n.seen ? (
-                      <span className="shrink-0 text-[10px] font-semibold text-slate-400">
+                      <span
+                        aria-hidden="true"
+                        className="shrink-0 text-[10px] font-semibold text-slate-400"
+                      >
                         Dibaca
                       </span>
                     ) : (
                       <button
                         type="button"
+                        tabIndex={-1}
                         onClick={() => setSeen((s) => ({ ...s, [n.id]: true }))}
+                        aria-label={`Tandai ${n.title} sudah dibaca`}
                         className="shrink-0 rounded-full bg-slate-800 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-slate-700"
                       >
                         Tandai dibaca
@@ -644,7 +842,7 @@ function Index() {
                 <button
                   type="button"
                   onClick={markAllSeen}
-                  className="mt-3 w-full rounded-xl bg-slate-100 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-200"
+                  className="mt-3 w-full rounded-xl bg-slate-100 py-2.5 text-xs font-bold text-slate-700 hover:bg-slate-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-800"
                 >
                   Tandai semua sudah dibaca
                 </button>
@@ -663,23 +861,23 @@ function Index() {
               type="button"
               onClick={() => setTab("home")}
               aria-current={tab === "home" ? "page" : undefined}
-              className={`flex flex-col items-center gap-1 py-3 text-[11px] font-semibold ${
+              className={`flex min-h-11 flex-col items-center gap-1 py-3 text-[11px] font-semibold ${
                 tab === "home" ? "text-slate-800" : "text-slate-400"
               }`}
             >
               <Home className="size-5" aria-hidden="true" />
-              Home
+              Ringkasan
             </button>
             <button
               type="button"
               onClick={() => setTab("settings")}
               aria-current={tab === "settings" ? "page" : undefined}
-              className={`flex flex-col items-center gap-1 py-3 text-[11px] font-semibold ${
+              className={`flex min-h-11 flex-col items-center gap-1 py-3 text-[11px] font-semibold ${
                 tab === "settings" ? "text-slate-800" : "text-slate-400"
               }`}
             >
               <Settings className="size-5" aria-hidden="true" />
-              Settings
+              Pengaturan
             </button>
           </div>
         </nav>
